@@ -364,7 +364,7 @@ class Reservation(ModifiableModel):
         for dt in (self.begin, self.end):
             days = opening_hours.get(dt.date(), [])
             day = next((day for day in days if day['opens'] is not None and day['opens'] <= dt <= day['closes']), None)
-            if day and not is_valid_time_slot(dt, self.resource.slot_size, day['opens']):
+            if day and not is_valid_time_slot(dt, self.resource.slot_size, day['opens']) and not settings.ENABLE_USER_MULTIPLE_RESERVATION_DATES and not settings.ENABLE_USER_IGNORE_OPENING_HOURS:
                 raise ValidationError(_("Begin and end time must match time slots"), code='invalid_time_slot')
 
         # Check if Unit has disallow_overlapping_reservations value of True
