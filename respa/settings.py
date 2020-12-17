@@ -411,3 +411,8 @@ if 'SECRET_KEY' not in locals():
 #
 if DATABASES['default']['ENGINE'] != 'django.contrib.gis.db.backends.postgis':
     raise ImproperlyConfigured("Only postgis database backend is supported")
+
+# Setting for max number of fields in REST calls. When units (libraries) are fetched from
+# Kirkanta for over a year the number of fields in Unit will go over the default 1000 field limit.
+# This will prevent all actions!
+DATA_UPLOAD_MAX_NUMBER_FIELDS=env('DATA_UPLOAD_MAX_NUMBER_FIELDS', default=10000)
