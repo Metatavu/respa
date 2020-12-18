@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 from decimal import Decimal
 import pytest
+import datetime
 from django.core.files.base import ContentFile
 from django.core.exceptions import ValidationError
 from django.utils.translation import activate
 from PIL import Image
 
+from resources.enums import UnitAuthorizationLevel, UnitGroupAuthorizationLevel
 from resources.errors import InvalidImage
-from resources.models import ResourceImage
+from resources.models import ResourceImage, Resource
 from resources.tests.utils import create_resource_image, get_test_image_data, get_field_errors
 
 
@@ -85,19 +87,74 @@ def test_invalid_image(space_resource):
 def test_price_validations(resource_in_unit):
     activate('en')
 
-    resource_in_unit.min_price_per_hour = Decimal(1)
-    resource_in_unit.max_price_per_hour = None
+    resource_in_unit.min_price = Decimal(1)
+    resource_in_unit.max_price = None
     resource_in_unit.full_clean()  # should not raise
 
-    resource_in_unit.min_price_per_hour = Decimal(8)
-    resource_in_unit.max_price_per_hour = Decimal(5)
+    resource_in_unit.min_price = Decimal(8)
+    resource_in_unit.max_price = Decimal(5)
     with pytest.raises(ValidationError) as ei:
         resource_in_unit.full_clean()
-    assert 'This value cannot be greater than max price per hour' in get_field_errors(ei.value, 'min_price_per_hour')
+    assert 'This value cannot be greater than max price' in get_field_errors(ei.value, 'min_price')
 
-    resource_in_unit.min_price_per_hour = Decimal(-5)
-    resource_in_unit.max_price_per_hour = Decimal(-8)
+    resource_in_unit.min_price = Decimal(-5)
+    resource_in_unit.max_price = Decimal(-8)
     with pytest.raises(ValidationError) as ei:
         resource_in_unit.full_clean()
-    assert 'Ensure this value is greater than or equal to 0.00.' in get_field_errors(ei.value, 'min_price_per_hour')
-    assert 'Ensure this value is greater than or equal to 0.00.' in get_field_errors(ei.value, 'max_price_per_hour')
+    assert 'Ensure this value is greater than or equal to 0.00.' in get_field_errors(ei.value, 'min_price')
+    assert 'Ensure this value is greater than or equal to 0.00.' in get_field_errors(ei.value, 'max_price')
+
+
+@pytest.mark.django_db
+def test_time_slot_validations(resource_in_unit):
+    activate('en')
+
+    resource_in_unit.min_period = datetime.timedelta(hours=2)
+    resource_in_unit.slot_size = datetime.timedelta(minutes=45)
+    with pytest.raises(ValidationError) as error:
+        resource_in_unit.full_clean()
+    assert 'This value must be a multiple of slot_size' in get_field_errors(error.value, 'min_period')
+
+    resource_in_unit.min_period = datetime.timedelta(hours=2)
+    resource_in_unit.slot_size = datetime.timedelta(minutes=30)
+    resource_in_unit.full_clean()
+
+
+@pytest.mark.django_db
+def test_queryset_with_perm(resource_in_unit, user):
+    resources = Resource.objects.with_perm('can_view_reservation_catering_orders', user)
+    assert not resources
+
+    user.unit_authorizations.create(
+        authorized=user,
+        level=UnitAuthorizationLevel.manager,
+        subject=resource_in_unit.unit
+    )
+    user.save()
+
+    resources = Resource.objects.with_perm('can_view_reservation_catering_orders', user)
+    assert resources
+    assert resource_in_unit in resources
+
+    user.unit_authorizations.create(
+        authorized=user,
+        level=UnitAuthorizationLevel.admin,
+        subject=resource_in_unit.unit
+    )
+
+    resources = Resource.objects.with_perm('can_modify_paid_reservations', user)
+    assert not resources
+
+    user.unit_authorizations.all().delete()
+
+    user.unit_authorizations.create(
+        authorized=user,
+        level=UnitAuthorizationLevel.viewer,
+        subject=resource_in_unit.unit
+    )
+
+    resources = Resource.objects.with_perm('can_modify_reservations', user)
+    assert resources
+    assert resource_in_unit in resources
+
+

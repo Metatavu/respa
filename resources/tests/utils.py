@@ -13,6 +13,8 @@ from resources.models import ResourceImage
 
 UNSAFE_METHODS = ('post', 'put', 'patch', 'delete')
 
+MAX_QUERIES = 50
+
 
 def get_test_image_data(size=(32, 32), color=(250, 250, 210), format="JPEG"):
     """
@@ -190,3 +192,8 @@ def assert_response_objects(response, objects):
 def check_keys(data, expected_keys):
     assert len(data.keys()) == len(expected_keys)
     assert set(data.keys()) == set(expected_keys)
+
+
+def is_partial_dict_in_list(partial, dicts):
+    partial_items = partial.items()
+    return any([partial_items <= d.items() for d in dicts])

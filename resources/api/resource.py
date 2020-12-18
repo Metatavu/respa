@@ -1,5 +1,6 @@
 import collections
 import datetime
+import logging
 
 import arrow
 import django_filters
@@ -7,25 +8,39 @@ import pytz
 from arrow.parser import ParserError
 
 from django import forms
-from django.db.models import Prefetch, Q
+from django.conf import settings
+from django.db.models import OuterRef, Prefetch, Q, Subquery, Value, Sum
+from django.db.models.functions import Coalesce, Least
 from django.urls import reverse
 from django.contrib.gis.db.models.functions import Distance
 from django.contrib.gis.geos import Point
+from django.contrib.auth import get_user_model
+
 from resources.pagination import PurposePagination
 from rest_framework import exceptions, filters, mixins, serializers, viewsets, response, status
-from rest_framework.decorators import detail_route
+from rest_framework.authentication import SessionAuthentication, TokenAuthentication
+from rest_framework.decorators import action
 from guardian.core import ObjectPermissionChecker
 
 from munigeo import api as munigeo_api
 from resources.models import (
-    Purpose, Reservation, Resource, ResourceImage, ResourceType, ResourceEquipment,
-    TermsOfUse, Equipment, ReservationMetadataSet, ResourceDailyOpeningHours
+    AccessibilityValue, AccessibilityViewpoint, Purpose, Reservation, Resource, ResourceAccessibility,
+    ResourceImage, ResourceType, ResourceEquipment, TermsOfUse, Equipment, ReservationMetadataSet,
+    ResourceDailyOpeningHours, UnitAccessibility
 )
+from resources.models.accessibility import get_resource_accessibility_url
 from resources.models.resource import determine_hours_time_range
-from .base import TranslatedModelSerializer, register_view, DRFFilterBooleanWidget
+
+from ..auth import is_general_admin, is_staff
+from .accessibility import ResourceAccessibilitySerializer
+from .base import ExtraDataMixin, TranslatedModelSerializer, register_view, DRFFilterBooleanWidget
 from .reservation import ReservationSerializer
 from .unit import UnitSerializer
 from .equipment import EquipmentSerializer
+from rest_framework.settings import api_settings as drf_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_query_time_range(params):
@@ -49,7 +64,7 @@ def parse_query_time_range(params):
 
 def get_resource_reservations_queryset(begin, end):
     qs = Reservation.objects.filter(begin__lte=end, end__gte=begin).current()
-    qs = qs.order_by('begin').prefetch_related('catering_orders').select_related('user')
+    qs = qs.order_by('begin').prefetch_related('catering_orders').select_related('user', 'order')
     return qs
 
 
@@ -65,7 +80,8 @@ class PurposeViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = PurposePagination
 
     def get_queryset(self):
-        if self.request.user.is_staff:
+        user = self.request.user
+        if is_staff(user) or is_general_admin(user):
             return self.queryset
         else:
             return self.queryset.filter(public=True)
@@ -81,7 +97,7 @@ class ResourceTypeSerializer(TranslatedModelSerializer):
 
 
 class ResourceTypeFilterSet(django_filters.FilterSet):
-    resource_group = django_filters.Filter(name='resource__groups__identifier', lookup_expr='in',
+    resource_group = django_filters.Filter(field_name='resource__groups__identifier', lookup_expr='in',
                                            widget=django_filters.widgets.CSVWidget, distinct=True)
 
     class Meta:
@@ -93,7 +109,8 @@ class ResourceTypeViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = ResourceType.objects.all()
     serializer_class = ResourceTypeSerializer
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend,)
-    filter_class = ResourceTypeFilterSet
+    filterset_class = ResourceTypeFilterSet
+
 
 register_view(ResourceTypeViewSet, 'type')
 
@@ -137,7 +154,7 @@ class TermsOfUseSerializer(TranslatedModelSerializer):
         fields = ('text',)
 
 
-class ResourceSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSerializer):
+class ResourceSerializer(ExtraDataMixin, TranslatedModelSerializer, munigeo_api.GeoModelSerializer):
     purposes = PurposeSerializer(many=True)
     images = NestedResourceImageSerializer(many=True)
     equipment = ResourceEquipmentSerializer(many=True, read_only=True, source='resource_equipment')
@@ -153,15 +170,74 @@ class ResourceSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSerializ
     required_reservation_extra_fields = serializers.ReadOnlyField(source='get_required_reservation_extra_field_names')
     is_favorite = serializers.SerializerMethodField()
     generic_terms = serializers.SerializerMethodField()
-    reservable_days_in_advance = serializers.ReadOnlyField(source='get_reservable_days_in_advance')
+    payment_terms = serializers.SerializerMethodField()
+    accessibility_base_url = serializers.SerializerMethodField()
+    # deprecated, backwards compatibility
+    reservable_days_in_advance = serializers.ReadOnlyField(source='get_reservable_max_days_in_advance')
+    reservable_max_days_in_advance = serializers.ReadOnlyField(source='get_reservable_max_days_in_advance')
     reservable_before = serializers.SerializerMethodField()
+    reservable_min_days_in_advance = serializers.ReadOnlyField(source='get_reservable_min_days_in_advance')
+    reservable_after = serializers.SerializerMethodField()
+    max_price_per_hour = serializers.SerializerMethodField()
+    min_price_per_hour = serializers.SerializerMethodField()
+
+    def get_max_price_per_hour(self, obj):
+        """Backwards compatibility for 'max_price_per_hour' field that is now deprecated"""
+        return obj.max_price if obj.price_type == Resource.PRICE_TYPE_HOURLY else None
+
+    def get_min_price_per_hour(self, obj):
+        """Backwards compatibility for 'min_price_per_hour' field that is now deprecated"""
+        return obj.min_price if obj.price_type == Resource.PRICE_TYPE_HOURLY else None
+
+    def get_extra_fields(self, includes, context):
+        """ Define extra fields that can be included via query parameters. Method from ExtraDataMixin."""
+        extra_fields = {}
+        if 'accessibility_summaries' in includes:
+            extra_fields['accessibility_summaries'] = serializers.SerializerMethodField()
+        if 'unit_detail' in includes:
+            extra_fields['unit'] = UnitSerializer(read_only=True, context=context)
+        return extra_fields
+
+    def get_accessibility_summaries(self, obj):
+        """ Get accessibility summaries for the resource. If data is missing for
+        any accessibility viewpoints, unknown values are returned for those.
+        """
+        if 'accessibility_viewpoint_cache' in self.context:
+            accessibility_viewpoints = self.context['accessibility_viewpoint_cache']
+        else:
+            accessibility_viewpoints = AccessibilityViewpoint.objects.all()
+        summaries_by_viewpoint = {acc_s.viewpoint_id: acc_s for acc_s in obj.accessibility_summaries.all()}
+        summaries = [
+            summaries_by_viewpoint.get(
+                vp.id,
+                ResourceAccessibility(
+                    viewpoint=vp,
+                    resource=obj,
+                    value=AccessibilityValue(value=AccessibilityValue.UNKNOWN_VALUE),
+                    shortage_count=0,
+                )
+            )
+            for vp in accessibility_viewpoints
+        ]
+        return [ResourceAccessibilitySerializer(summary).data for summary in summaries]
+
+    def get_accessibility_base_url(self, obj):
+        return get_resource_accessibility_url(obj)
 
     def get_user_permissions(self, obj):
         request = self.context.get('request', None)
+        prefetched_user = self.context.get('prefetched_user', None)
+
+        if request:
+            user = prefetched_user or request.user
+
         return {
-            'can_make_reservations': obj.can_make_reservations(request.user) if request else False,
-            'can_ignore_opening_hours': obj.can_ignore_opening_hours(request.user) if request else False,
-            'is_admin': obj.is_admin(request.user) if request else False,
+            'can_make_reservations': obj.can_make_reservations(user) if request else False,
+            'can_ignore_opening_hours': obj.can_ignore_opening_hours(user) if request else False,
+            'is_admin': obj.is_admin(user) if request else False,
+            'is_manager': obj.is_manager(user) if request else False,
+            'is_viewer': obj.is_viewer(user) if request else False,
+            'can_bypass_payment': obj.can_bypass_payment(user) if request else False,
         }
 
     def get_is_favorite(self, obj):
@@ -172,14 +248,35 @@ class ResourceSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSerializ
         data = TermsOfUseSerializer(obj.generic_terms).data
         return data['text']
 
+    def get_payment_terms(self, obj):
+        data = TermsOfUseSerializer(obj.payment_terms).data
+        return data['text']
+
     def get_reservable_before(self, obj):
         request = self.context.get('request')
-        user = request.user if request else None
+        prefetched_user = self.context.get('prefetched_user', None)
+
+        user = None
+        if request:
+            user = prefetched_user or request.user
 
         if user and obj.is_admin(user):
             return None
         else:
             return obj.get_reservable_before()
+
+    def get_reservable_after(self, obj):
+        request = self.context.get('request')
+        prefetched_user = self.context.get('prefetched_user', None)
+
+        user = None
+        if request:
+            user = prefetched_user or request.user
+
+        if user and obj.is_admin(user):
+            return None
+        else:
+            return obj.get_reservable_after()
 
     def to_representation(self, obj):
         # we must parse the time parameters before serializing
@@ -261,16 +358,36 @@ class ResourceSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSerializ
             rv_list = get_resource_reservations_queryset(self.context['start'], self.context['end'])
             rv_list = rv_list.filter(resource=obj)
 
+        rv_list = list(rv_list)
+        if not rv_list:
+            return []
+
         rv_ser_list = ReservationSerializer(rv_list, many=True, context=self.context).data
         return rv_ser_list
 
     class Meta:
         model = Resource
-        exclude = ('reservation_confirmed_notification_extra', 'access_code_type', 'reservation_metadata_set')
+        exclude = ('reservation_requested_notification_extra', 'reservation_confirmed_notification_extra',
+                   'access_code_type', 'reservation_metadata_set')
 
 
 class ResourceDetailsSerializer(ResourceSerializer):
     unit = UnitSerializer()
+
+
+class ResourceInlineSerializer(ResourceDetailsSerializer):
+    """
+    Serializer that has a limited set of fields in order to avoid
+    performance issues. Used by .reservation.ReservationSerializer,
+    when request has 'include=resource_detail` parameter.
+
+    Before including any other fields here make sure that the view
+    which will call this serializer has optimized queryset, i.e. it
+    selects/prefetches related fields.
+    """
+    class Meta:
+        model = Resource
+        fields = ('id', 'name', 'unit', 'location')
 
 
 class ParentFilter(django_filters.Filter):
@@ -280,7 +397,7 @@ class ParentFilter(django_filters.Filter):
 
     def filter(self, qs, value):
         child_matches = super().filter(qs, value)
-        self.name = self.name.replace('__id', '__parent__id')
+        self.field_name = self.field_name.replace('__id', '__parent__id')
         parent_matches = super().filter(qs, value)
         return child_matches | parent_matches
 
@@ -289,27 +406,99 @@ class ParentCharFilter(ParentFilter):
     field_class = forms.CharField
 
 
+class ResourceOrderingFilter(django_filters.OrderingFilter):
+    """
+    Resource ordering with added capabilities for Accessibility data.
+    """
+
+    def filter(self, qs, value):
+        if value and ('accessibility' in value or '-accessibility' in value):
+            viewpoint_ids = self.parent.data.getlist('accessibility_viewpoint', [])
+            try:
+                accessibility_viewpoints = AccessibilityViewpoint.objects.filter(id__in=viewpoint_ids)
+            except AccessibilityViewpoint.DoesNotExist:
+                accessibility_viewpoints = AccessibilityViewpoint.objects.all()[:1]
+            if len(accessibility_viewpoints) == 0:
+                logging.error('Accessibility Viewpoints are not imported from Accessibility database')
+                value = [val for val in value if val != 'accessibility' and val != '-accessibility']
+                return super().filter(qs, value)
+
+            # annotate the queryset with accessibility priority from selected viewpoints.
+            # use the worse value of the resource and unit accessibilities.
+            # missing accessibility data is considered same priority as UNKNOWN.
+            # order_by must be cleared in subquery for values() to trigger correct GROUP BY.
+            resource_accessibility_summary = ResourceAccessibility.objects.filter(
+                resource_id=OuterRef('pk'),
+                viewpoint__in=accessibility_viewpoints,
+            ).order_by().values(
+                'resource_id',
+            ).annotate(
+                order_sum=Sum(
+                    Coalesce('order', Value(AccessibilityValue.UNKNOWN_ORDERING))
+                )
+            )
+            resource_accessibility_order = Subquery(resource_accessibility_summary.values('order_sum'))
+            unit_accessibility_summary = UnitAccessibility.objects.filter(
+                unit_id=OuterRef('unit_id'),
+                viewpoint__in=accessibility_viewpoints,
+            ).order_by().values(
+                'unit_id',
+            ).annotate(
+                order_sum=Sum(
+                    Coalesce('order', Value(AccessibilityValue.UNKNOWN_ORDERING))
+                )
+            )
+            unit_accessibility_order = Subquery(unit_accessibility_summary.values('order_sum'))
+            qs = qs.annotate(
+                accessibility_priority=Least(
+                    resource_accessibility_order,
+                    unit_accessibility_order,
+                ),
+            ).prefetch_related('accessibility_summaries')
+        qs = super().filter(qs, value)
+        return qs
+
+
 class ResourceFilterSet(django_filters.FilterSet):
     def __init__(self, *args, **kwargs):
         self.user = kwargs.pop('user')
         super().__init__(*args, **kwargs)
 
-    purpose = ParentCharFilter(name='purposes__id', lookup_expr='iexact')
-    type = django_filters.Filter(name='type__id', lookup_expr='in', widget=django_filters.widgets.CSVWidget)
-    people = django_filters.NumberFilter(name='people_capacity', lookup_expr='gte')
-    need_manual_confirmation = django_filters.BooleanFilter(name='need_manual_confirmation',
+    purpose = ParentCharFilter(field_name='purposes__id', lookup_expr='iexact')
+    type = django_filters.Filter(field_name='type__id', lookup_expr='in', widget=django_filters.widgets.CSVWidget)
+    people = django_filters.NumberFilter(field_name='people_capacity', lookup_expr='gte')
+    need_manual_confirmation = django_filters.BooleanFilter(field_name='need_manual_confirmation',
                                                             widget=DRFFilterBooleanWidget)
     is_favorite = django_filters.BooleanFilter(method='filter_is_favorite', widget=DRFFilterBooleanWidget)
-    unit = django_filters.CharFilter(name='unit__id', lookup_expr='iexact')
-    resource_group = django_filters.Filter(name='groups__identifier', lookup_expr='in',
+    unit = django_filters.CharFilter(field_name='unit__id', lookup_expr='iexact')
+    resource_group = django_filters.Filter(field_name='groups__identifier', lookup_expr='in',
                                            widget=django_filters.widgets.CSVWidget, distinct=True)
-    equipment = django_filters.Filter(name='resource_equipment__equipment__id', lookup_expr='in',
+    equipment = django_filters.Filter(field_name='resource_equipment__equipment__id', lookup_expr='in',
                                       widget=django_filters.widgets.CSVWidget, distinct=True)
     available_between = django_filters.Filter(method='filter_available_between',
                                               widget=django_filters.widgets.CSVWidget)
+    free_of_charge = django_filters.BooleanFilter(method='filter_free_of_charge',
+                                                  widget=DRFFilterBooleanWidget)
+    municipality = django_filters.Filter(field_name='unit__municipality_id', lookup_expr='in',
+                                         widget=django_filters.widgets.CSVWidget, distinct=True)
+    order_by = ResourceOrderingFilter(
+        fields=(
+            ('name_fi', 'resource_name_fi'),
+            ('name_en', 'resource_name_en'),
+            ('name_sv', 'resource_name_sv'),
+            ('unit__name_fi', 'unit_name_fi'),
+            ('unit__name_en', 'unit_name_en'),
+            ('unit__name_sv', 'unit_name_sv'),
+            ('type__name_fi', 'type_name_fi'),
+            ('type__name_en', 'type_name_en'),
+            ('type__name_sv', 'type_name_sv'),
+            ('people_capacity', 'people_capacity'),
+            ('accessibility_priority', 'accessibility'),
+        ),
+    )
 
     def filter_is_favorite(self, queryset, name, value):
-        if not self.user.is_authenticated():
+        if not self.user.is_authenticated:
             if value:
                 return queryset.none()
             else:
@@ -319,6 +508,13 @@ class ResourceFilterSet(django_filters.FilterSet):
             return queryset.filter(favorited_by=self.user)
         else:
             return queryset.exclude(favorited_by=self.user)
+
+    def filter_free_of_charge(self, queryset, name, value):
+        qs = Q(min_price__lte=0) | Q(min_price__isnull=True)
+        if value:
+            return queryset.filter(qs)
+        else:
+            return queryset.exclude(qs)
 
     def _deserialize_datetime(self, value):
         try:
@@ -450,7 +646,7 @@ class ResourceFilterSet(django_filters.FilterSet):
 
     class Meta:
         model = Resource
-        fields = ['purpose', 'type', 'people', 'need_manual_confirmation', 'is_favorite', 'unit', 'available_between']
+        fields = ['purpose', 'type', 'people', 'need_manual_confirmation', 'is_favorite', 'unit', 'available_between', 'min_price']
 
 
 class ResourceFilterBackend(filters.BaseFilterBackend):
@@ -459,6 +655,12 @@ class ResourceFilterBackend(filters.BaseFilterBackend):
     """
 
     def filter_queryset(self, request, queryset, view):
+        accessibility_filtering = request.query_params.get('order_by', None) == 'accessibility'
+        viewpoint_defined = 'accessibility_viewpoint' in request.query_params
+        if accessibility_filtering and not viewpoint_defined:
+            error_message = "'accessibility_viewpoint' must be defined when ordering by accessibility"
+            raise exceptions.ParseError(error_message)
+
         return ResourceFilterSet(request.query_params, queryset=queryset, user=request.user).qs
 
 
@@ -559,6 +761,8 @@ class ResourceCacheMixin:
             context['reservations_cache'] = self._preload_reservations(times)
         context['opening_hours_cache'] = self._preload_opening_hours(times)
 
+        context['accessibility_viewpoint_cache'] = AccessibilityViewpoint.objects.all()
+
         self._preload_permissions()
 
         return context
@@ -566,14 +770,26 @@ class ResourceCacheMixin:
 
 class ResourceListViewSet(munigeo_api.GeoModelAPIView, mixins.ListModelMixin,
                           viewsets.GenericViewSet, ResourceCacheMixin):
-    queryset = Resource.objects.select_related('generic_terms', 'unit', 'type', 'reservation_metadata_set')
+    queryset = Resource.objects.select_related('generic_terms', 'payment_terms', 'unit', 'type', 'reservation_metadata_set')
     queryset = queryset.prefetch_related('favorited_by', 'resource_equipment', 'resource_equipment__equipment',
                                          'purposes', 'images', 'purposes', 'groups')
-    serializer_class = ResourceSerializer
+    if settings.RESPA_PAYMENTS_ENABLED:
+        queryset = queryset.prefetch_related('products')
     filter_backends = (filters.SearchFilter, ResourceFilterBackend, LocationFilterBackend)
     search_fields = ('name_fi', 'description_fi', 'unit__name_fi',
                      'name_sv', 'description_sv', 'unit__name_sv',
                      'name_en', 'description_en', 'unit__name_en')
+    serializer_class = ResourceSerializer
+    authentication_classes = (
+        list(drf_settings.DEFAULT_AUTHENTICATION_CLASSES) +
+        [SessionAuthentication])
+
+    def get_serializer_class(self):
+        if settings.RESPA_PAYMENTS_ENABLED:
+            from payments.api.resource import PaymentsResourceSerializer  # noqa
+            return PaymentsResourceSerializer
+        else:
+            return ResourceSerializer
 
     def get_serializer(self, page, *args, **kwargs):
         self._page = page
@@ -582,19 +798,34 @@ class ResourceListViewSet(munigeo_api.GeoModelAPIView, mixins.ListModelMixin,
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context.update(self._get_cache_context())
+
+        request_user = self.request.user
+        if request_user.is_authenticated:
+            prefetched_user = get_user_model().objects.prefetch_related('unit_authorizations', 'unit_group_authorizations__subject__members').\
+                get(pk=request_user.pk)
+
+            context['prefetched_user'] = prefetched_user
+
         return context
 
     def get_queryset(self):
-        if self.request.user.is_staff:
-            return self.queryset
-        else:
-            return self.queryset.filter(public=True)
+        return self.queryset.visible_for(self.request.user)
 
 
 class ResourceViewSet(munigeo_api.GeoModelAPIView, mixins.RetrieveModelMixin,
                       viewsets.GenericViewSet, ResourceCacheMixin):
-    serializer_class = ResourceDetailsSerializer
     queryset = ResourceListViewSet.queryset
+    authentication_classes = (
+        list(drf_settings.DEFAULT_AUTHENTICATION_CLASSES) +
+        [SessionAuthentication] +
+        ([TokenAuthentication] if settings.ENABLE_RESOURCE_TOKEN_AUTH else []))
+
+    def get_serializer_class(self):
+        if settings.RESPA_PAYMENTS_ENABLED:
+            from payments.api.resource import PaymentsResourceDetailsSerializer  # noqa
+            return PaymentsResourceDetailsSerializer
+        else:
+            return ResourceDetailsSerializer
 
     def get_serializer(self, page, *args, **kwargs):
         self._page = [page]
@@ -603,20 +834,24 @@ class ResourceViewSet(munigeo_api.GeoModelAPIView, mixins.RetrieveModelMixin,
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context.update(self._get_cache_context())
+
+        request_user = self.request.user
+        if request_user.is_authenticated:
+            prefetched_user = get_user_model().objects.prefetch_related('unit_authorizations', 'unit_group_authorizations__subject__members').\
+                get(pk=request_user.pk)
+
+            context['prefetched_user'] = prefetched_user
+
         return context
 
     def get_queryset(self):
-        if self.request.user.is_staff:
-            return self.queryset
-        else:
-            return self.queryset.filter(public=True)
+        return self.queryset.visible_for(self.request.user)
 
     def _set_favorite(self, request, value):
         resource = self.get_object()
         user = request.user
 
         exists = user.favorite_resources.filter(id=resource.id).exists()
-
         if value:
             if not exists:
                 user.favorite_resources.add(resource)
@@ -630,11 +865,11 @@ class ResourceViewSet(munigeo_api.GeoModelAPIView, mixins.RetrieveModelMixin,
             else:
                 return response.Response(status=status.HTTP_304_NOT_MODIFIED)
 
-    @detail_route(methods=['post'])
+    @action(detail=True, methods=['post'])
     def favorite(self, request, pk=None):
         return self._set_favorite(request, True)
 
-    @detail_route(methods=['post'])
+    @action(detail=True, methods=['post'])
     def unfavorite(self, request, pk=None):
         return self._set_favorite(request, False)
 

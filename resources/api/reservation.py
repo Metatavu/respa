@@ -1,7 +1,11 @@
+import operator
 import uuid
+from functools import reduce
+
 import arrow
 import django_filters
 from arrow.parser import ParserError
+from django.conf import settings
 from guardian.core import ObjectPermissionChecker
 from django.contrib.auth import get_user_model
 from django.utils.translation import ugettext_lazy as _
@@ -12,21 +16,27 @@ from django.db.models import Q
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, serializers, filters, exceptions, permissions
-from rest_framework.authentication import TokenAuthentication
+from rest_framework.authentication import TokenAuthentication, SessionAuthentication
 from rest_framework.fields import BooleanField, IntegerField
 from rest_framework import renderers
 from rest_framework.exceptions import NotAcceptable, ValidationError
+from rest_framework.settings import api_settings as drf_settings
 
-from helusers.jwt import JWTAuthentication
 from munigeo import api as munigeo_api
-from resources.models import Reservation, Resource, ReservationMetadataSet
+
+from resources.models import (
+    Reservation, Resource, ReservationMetadataSet, ReservationCancelReasonCategory, ReservationCancelReason)
 from resources.models.reservation import RESERVATION_EXTRA_FIELDS
 from resources.pagination import ReservationPagination
 from resources.models.utils import generate_reservation_xlsx, get_object_or_none
 
+from ..auth import is_general_admin
 from .base import (
-    NullableDateTimeField, TranslatedModelSerializer, register_view, DRFFilterBooleanWidget
+    NullableDateTimeField, TranslatedModelSerializer, register_view, DRFFilterBooleanWidget,
+    ExtraDataMixin
 )
+
+from respa.renderers import ResourcesBrowsableAPIRenderer
 
 User = get_user_model()
 
@@ -62,23 +72,44 @@ class UserSerializer(TranslatedModelSerializer):
         fields = ('id', 'display_name', 'email')
 
 
-class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSerializer):
+class ReservationCancelReasonCategorySerializer(TranslatedModelSerializer):
+    class Meta:
+        model = ReservationCancelReasonCategory
+        fields = [
+            'id', 'reservation_type', 'name', 'description'
+        ]
+
+
+class ReservationCancelReasonSerializer(serializers.ModelSerializer):
+    category = ReservationCancelReasonCategorySerializer(read_only=True)
+    category_id = serializers.PrimaryKeyRelatedField(write_only=True,
+                                                     source='category',
+                                                     queryset=ReservationCancelReasonCategory.objects.all())
+
+    class Meta:
+        model = ReservationCancelReason
+        fields = [
+            'category', 'description', 'reservation', 'category_id'
+        ]
+
+class ReservationSerializer(ExtraDataMixin, TranslatedModelSerializer, munigeo_api.GeoModelSerializer):
     begin = NullableDateTimeField()
     end = NullableDateTimeField()
     user = UserSerializer(required=False)
     is_own = serializers.SerializerMethodField()
     state = serializers.ChoiceField(choices=Reservation.STATE_CHOICES, required=False)
     need_manual_confirmation = serializers.ReadOnlyField()
-    staff_event = serializers.BooleanField(required=False, write_only=True)
     user_permissions = serializers.SerializerMethodField()
+    cancel_reason = ReservationCancelReasonSerializer(required=False)
+    patchable_fields = ['state', 'cancel_reason']
 
     class Meta:
         model = Reservation
         fields = [
             'url', 'id', 'resource', 'user', 'begin', 'end', 'comments', 'is_own', 'state', 'need_manual_confirmation',
-            'staff_event', 'access_code', 'user_permissions'
+            'staff_event', 'access_code', 'user_permissions', 'type', 'cancel_reason'
         ] + list(RESERVATION_EXTRA_FIELDS)
-        read_only_fields = RESERVATION_EXTRA_FIELDS
+        read_only_fields = list(RESERVATION_EXTRA_FIELDS)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -101,12 +132,12 @@ class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSeria
             supported = resource.get_supported_reservation_extra_field_names(cache=cache)
             required = resource.get_required_reservation_extra_field_names(cache=cache)
 
-            if resource.need_manual_confirmation:
+            # staff events have less requirements
+            request_user = self.context['request'].user
+            is_staff_event = data.get('staff_event', False)
 
-                # manually confirmed reservations have some extra conditions
-                can_approve = resource.can_approve_reservations(self.context['request'].user)
-                if data.get('staff_event', False) and can_approve:
-                    required = {'reserver_name', 'event_description'}
+            if is_staff_event and resource.can_create_staff_event(request_user):
+                required = {'reserver_name', 'event_description'}
 
             # we don't need to remove a field here if it isn't supported, as it will be read-only and will be more
             # easily removed in to_representation()
@@ -115,6 +146,17 @@ class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSeria
 
             for field_name in required:
                 self.fields[field_name].required = True
+
+        self.context.update({'resource': resource})
+
+    def get_extra_fields(self, includes, context):
+        from .resource import ResourceInlineSerializer
+
+        """ Define extra fields that can be included via query parameters. Method from ExtraDataMixin."""
+        extra_fields = {}
+        if 'resource_detail' in includes:
+            extra_fields['resource'] = ResourceInlineSerializer(read_only=True, context=context)
+        return extra_fields
 
     def validate_state(self, value):
         instance = self.instance
@@ -133,6 +175,9 @@ class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSeria
             if instance.state in allowed_states and value in allowed_states:
                 return value
 
+        if instance.can_modify(request_user) and value == Reservation.CANCELLED:
+            return value
+
         raise ValidationError(_('Illegal state change'))
 
     def validate(self, data):
@@ -148,24 +193,37 @@ class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSeria
         if not resource.can_make_reservations(request_user):
             raise PermissionDenied(_('You are not allowed to make reservations in this resource.'))
 
-        if data['end'] < timezone.now():
+        if 'end' in data and data['end'] < timezone.now():
             raise ValidationError(_('You cannot make a reservation in the past'))
 
-        if not resource.is_admin(request_user):
+        if not resource.can_ignore_opening_hours(request_user):
             reservable_before = resource.get_reservable_before()
             if reservable_before and data['begin'] >= reservable_before:
                 raise ValidationError(_('The resource is reservable only before %(datetime)s' %
                                         {'datetime': reservable_before}))
+            reservable_after = resource.get_reservable_after()
+            if reservable_after and data['begin'] < reservable_after:
+                raise ValidationError(_('The resource is reservable only after %(datetime)s' %
+                                        {'datetime': reservable_after}))
 
         # normal users cannot make reservations for other people
-        if not resource.is_admin(request_user):
+        if not resource.can_create_reservations_for_other_users(request_user):
             data.pop('user', None)
 
         # Check user specific reservation restrictions relating to given period.
         resource.validate_reservation_period(reservation, request_user, data=data)
 
+        if data.get('staff_event', False):
+            if not resource.can_create_staff_event(request_user):
+                raise ValidationError(dict(staff_event=_('Only allowed to be set by resource managers')))
+
+        if 'type' in data:
+            if (data['type'] != Reservation.TYPE_NORMAL and
+                    not resource.can_create_special_type_reservation(request_user)):
+                raise ValidationError({'type': _('You are not allowed to make a reservation of this type')})
+
         if 'comments' in data:
-            if not resource.is_admin(request_user):
+            if not resource.can_comment_reservations(request_user):
                 raise ValidationError(dict(comments=_('Only allowed to be set by staff members')))
 
         if 'access_code' in data:
@@ -191,22 +249,26 @@ class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSeria
         if reservation is None:
             resource.validate_max_reservations_per_user(request_user)
 
-        # Run model clean
-        data.pop('staff_event', None)
-        instance = Reservation(**data)
-        try:
-            instance.clean(original_reservation=reservation)
-        except DjangoValidationError as exc:
+        if self.context['request'] and self.context['request'].method == 'PATCH':
+            for key, val in data.items():
+                if key not in self.patchable_fields:
+                    raise ValidationError(_('Patching of field %(field)s is not allowed' % {'field': key}))
+        else:
+             # Run model clean
+            instance = Reservation(**data)
 
-            # Convert Django ValidationError to DRF ValidationError so that in the response
-            # field specific error messages are added in the field instead of in non_field_messages.
-            if not hasattr(exc, 'error_dict'):
-                raise ValidationError(exc)
-            error_dict = {}
-            for key, value in exc.error_dict.items():
-                error_dict[key] = [error.message for error in value]
-            raise ValidationError(error_dict)
+            try:
+                instance.clean(original_reservation=reservation, user=request_user)
+            except DjangoValidationError as exc:
 
+                # Convert Django ValidationError to DRF ValidationError so that in the response
+                # field specific error messages are added in the field instead of in non_field_messages.
+                if not hasattr(exc, 'error_dict'):
+                    raise ValidationError(exc)
+                error_dict = {}
+                for key, value in exc.error_dict.items():
+                    error_dict[key] = [error.message for error in value]
+                raise ValidationError(error_dict)
         return data
 
     def to_internal_value(self, data):
@@ -229,7 +291,8 @@ class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSeria
     def to_representation(self, instance):
         data = super(ReservationSerializer, self).to_representation(instance)
         resource = instance.resource
-        user = self.context['request'].user
+        prefetched_user = self.context.get('prefetched_user', None)
+        user = prefetched_user or self.context['request'].user
 
         if self.context['request'].accepted_renderer.format == 'xlsx':
             # Return somewhat different data in case we are dealing with xlsx.
@@ -240,19 +303,21 @@ class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSeria
                 'resource': resource.name,  # resource name instead of id
                 'begin': instance.begin,  # datetime object
                 'end': instance.end,  # datetime object
-                'user': instance.user.email,  # just email
+                'user': instance.user.email if instance.user else '',  # just email
                 'created_at': instance.created_at
             })
 
-        # Show the comments field and the user object only for staff
-        if not resource.is_admin(user):
+        if not resource.can_access_reservation_comments(user):
             del data['comments']
+
+        if not resource.can_view_reservation_user(user):
             del data['user']
 
         if instance.are_extra_fields_visible(user):
             cache = self.context.get('reservation_metadata_set_cache')
             supported_fields = set(resource.get_supported_reservation_extra_field_names(cache=cache))
         else:
+            del data['cancel_reason']
             supported_fields = set()
 
         for field_name in RESERVATION_EXTRA_FIELDS:
@@ -270,12 +335,36 @@ class ReservationSerializer(TranslatedModelSerializer, munigeo_api.GeoModelSeria
 
         return data
 
+    def update(self, instance, validated_data):
+        request = self.context['request']
+
+        cancel_reason = validated_data.pop('cancel_reason', None)
+        new_state = validated_data.pop('state', instance.state)
+
+        validated_data['modified_by'] = request.user
+        reservation = super().update(instance, validated_data)
+
+        if new_state in [Reservation.DENIED, Reservation.CANCELLED] and cancel_reason:
+            if hasattr(instance, 'cancel_reason'):
+                instance.cancel_reason.delete()
+
+            cancel_reason['reservation'] = reservation
+            reservation.cancel_reason = ReservationCancelReason(**cancel_reason)
+            reservation.cancel_reason.save()
+
+        reservation.set_state(new_state, request.user)
+
+        return reservation
+
     def get_is_own(self, obj):
         return obj.user == self.context['request'].user
 
     def get_user_permissions(self, obj):
         request = self.context.get('request')
-        can_modify_and_delete = obj.can_modify(request.user) if request else False
+        prefetched_user = self.context.get('prefetched_user', None)
+        user = prefetched_user or request.user
+
+        can_modify_and_delete = obj.can_modify(user) if request else False
         return {
             'can_modify': can_modify_and_delete,
             'can_delete': can_modify_and_delete,
@@ -322,18 +411,6 @@ class ExcludePastFilterBackend(filters.BaseFilterBackend):
         if not past:
             now = timezone.now()
             return queryset.filter(end__gte=now)
-        return queryset
-
-
-class ResourceFilterBackend(filters.BaseFilterBackend):
-    """
-    Filter reservations by resource.
-    """
-
-    def filter_queryset(self, request, queryset, view):
-        resource = request.query_params.get('resource', None)
-        if resource:
-            return queryset.filter(resource__id=resource)
         return queryset
 
 
@@ -424,25 +501,58 @@ class ReservationFilterSet(django_filters.rest_framework.FilterSet):
     event_subject = django_filters.CharFilter(lookup_expr='icontains')
     host_name = django_filters.CharFilter(lookup_expr='icontains')
     reserver_name = django_filters.CharFilter(lookup_expr='icontains')
-    resource_name = django_filters.CharFilter(name='resource', lookup_expr='name__icontains')
+    resource_name = django_filters.CharFilter(field_name='resource', lookup_expr='name__icontains')
     is_favorite_resource = django_filters.BooleanFilter(method='filter_is_favorite_resource',
                                                         widget=DRFFilterBooleanWidget)
-    resource_group = django_filters.Filter(name='resource__groups__identifier', lookup_expr='in',
+    resource_group = django_filters.Filter(field_name='resource__groups__identifier', lookup_expr='in',
                                            widget=django_filters.widgets.CSVWidget, distinct=True)
-    unit = django_filters.CharFilter(name='resource__unit_id')
+    unit = django_filters.CharFilter(field_name='resource__unit_id')
     has_catering_order = django_filters.BooleanFilter(method='filter_has_catering_order', widget=DRFFilterBooleanWidget)
+    resource = django_filters.Filter(lookup_expr='in', widget=django_filters.widgets.CSVWidget)
+
+    reserver_info_search = django_filters.CharFilter(method="filter_reserver_info_search")
 
     def filter_is_favorite_resource(self, queryset, name, value):
         user = self.request.user
 
         if not user.is_authenticated:
-            return queryset.none if value else queryset
+            return queryset.none() if value else queryset
 
         filtering = {'resource__favorited_by': user}
         return queryset.filter(**filtering) if value else queryset.exclude(**filtering)
 
     def filter_has_catering_order(self, queryset, name, value):
         return queryset.exclude(catering_orders__isnull=value)
+
+    def filter_reserver_info_search(self, queryset, name, value):
+        """
+        A partial copy of rest_framework.filters.SearchFilter.filter_queryset.
+        Needed due to custom filters applied to queryset within this ReservationFilterSet.
+
+        Does not support comma separation of values, i.e. '?reserver_info_search=foo,bar' will
+        be considered as one string - 'foo,bar'.
+        """
+        if not value:
+            return queryset
+
+        fields = ('user__first_name', 'user__last_name', 'user__email')
+        conditions = []
+        for field in fields:
+            conditions.append(Q(**{field + '__icontains': value}))
+
+        # assume that first_name and last_name were provided if empty space was found
+        if ' ' in value and value.count(' ') == 1:
+            name1, name2 = value.split()
+            filters = Q(
+                user__first_name__icontains=name1,
+                user__last_name__icontains=name2,
+            ) | Q(
+                user__first_name__icontains=name2,
+                user__last_name__icontains=name1,
+            )
+            conditions.append(filters)
+
+        return queryset.filter(reduce(operator.or_, conditions))
 
 
 class ReservationPermission(permissions.BasePermission):
@@ -502,17 +612,25 @@ class ReservationCacheMixin:
 class ReservationViewSet(munigeo_api.GeoModelAPIView, viewsets.ModelViewSet, ReservationCacheMixin):
     queryset = Reservation.objects.select_related('user', 'resource', 'resource__unit')\
         .prefetch_related('catering_orders').prefetch_related('resource__groups').order_by('begin', 'resource__unit__name', 'resource__name')
-
-    serializer_class = ReservationSerializer
-    filter_backends = (DjangoFilterBackend, filters.OrderingFilter, UserFilterBackend, ResourceFilterBackend,
-                       ReservationFilterBackend, NeedManualConfirmationFilterBackend, StateFilterBackend,
-                       CanApproveFilterBackend)
-    filter_class = ReservationFilterSet
+    if settings.RESPA_PAYMENTS_ENABLED:
+        queryset = queryset.prefetch_related('order', 'order__order_lines', 'order__order_lines__product')
+    filter_backends = (DjangoFilterBackend, filters.OrderingFilter, UserFilterBackend, ReservationFilterBackend,
+                       NeedManualConfirmationFilterBackend, StateFilterBackend, CanApproveFilterBackend)
+    filterset_class = ReservationFilterSet
     permission_classes = (permissions.IsAuthenticatedOrReadOnly, ReservationPermission)
-    renderer_classes = (renderers.JSONRenderer, renderers.BrowsableAPIRenderer, ReservationExcelRenderer)
+    renderer_classes = (renderers.JSONRenderer, ResourcesBrowsableAPIRenderer, ReservationExcelRenderer)
     pagination_class = ReservationPagination
-    authentication_classes = (JWTAuthentication, TokenAuthentication)
+    authentication_classes = (
+        list(drf_settings.DEFAULT_AUTHENTICATION_CLASSES) +
+        [TokenAuthentication, SessionAuthentication])
     ordering_fields = ('begin',)
+
+    def get_serializer_class(self):
+        if settings.RESPA_PAYMENTS_ENABLED:
+            from payments.api.reservation import PaymentsReservationSerializer  # noqa
+            return PaymentsReservationSerializer
+        else:
+            return ReservationSerializer
 
     def get_serializer(self, *args, **kwargs):
         if 'data' not in kwargs and len(args) == 1:
@@ -529,18 +647,28 @@ class ReservationViewSet(munigeo_api.GeoModelAPIView, viewsets.ModelViewSet, Res
         context = super().get_serializer_context(*args, **kwargs)
         if hasattr(self, '_page'):
             context.update(self._get_cache_context())
+
+        request_user = self.request.user
+
+        if request_user.is_authenticated:
+            prefetched_user = get_user_model().objects.prefetch_related('unit_authorizations', 'unit_group_authorizations__subject__members').\
+                get(pk=request_user.pk)
+
+            context['prefetched_user'] = prefetched_user
+
         return context
 
     def get_queryset(self):
         queryset = super().get_queryset()
         user = self.request.user
 
-        # staff members can see all reservations
-        if user.is_staff:
+        # General Administrators can see all reservations
+        if is_general_admin(user):
             return queryset
 
-        # normal users can see only their own reservations and reservations that are confirmed or requested
-        filters = Q(state__in=(Reservation.CONFIRMED, Reservation.REQUESTED))
+        # normal users can see only their own reservations and reservations that are confirmed, requested or
+        # waiting for payment
+        filters = Q(state__in=(Reservation.CONFIRMED, Reservation.REQUESTED, Reservation.WAITING_FOR_PAYMENT))
         if user.is_authenticated:
             filters |= Q(user=user)
         queryset = queryset.filter(filters)
@@ -557,20 +685,16 @@ class ReservationViewSet(munigeo_api.GeoModelAPIView, viewsets.ModelViewSet, Res
         instance = serializer.save(**override_data)
 
         resource = serializer.validated_data['resource']
-        staff_event = (self.request.data.get('staff_event', False) and
-                       resource.can_approve_reservations(self.request.user))
-        if resource.need_manual_confirmation and not staff_event:
+
+        if resource.need_manual_confirmation and not resource.can_bypass_manual_confirmation(self.request.user):
             new_state = Reservation.REQUESTED
         else:
-            new_state = Reservation.CONFIRMED
+            if instance.get_order():
+                new_state = Reservation.WAITING_FOR_PAYMENT
+            else:
+                new_state = Reservation.CONFIRMED
 
         instance.set_state(new_state, self.request.user)
-
-    def perform_update(self, serializer):
-        old_instance = self.get_object()
-        new_state = serializer.validated_data.pop('state', old_instance.state)
-        new_instance = serializer.save(modified_by=self.request.user)
-        new_instance.set_state(new_state, self.request.user)
 
     def perform_destroy(self, instance):
         instance.set_state(Reservation.CANCELLED, self.request.user)
@@ -588,4 +712,13 @@ class ReservationViewSet(munigeo_api.GeoModelAPIView, viewsets.ModelViewSet, Res
         return response
 
 
+class ReservationCancelReasonCategoryViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = ReservationCancelReasonCategory.objects.all()
+    filter_backends = (DjangoFilterBackend,)
+    serializer_class = ReservationCancelReasonCategorySerializer
+    filterset_fields = ['reservation_type']
+    pagination_class = None
+
+
 register_view(ReservationViewSet, 'reservation')
+register_view(ReservationCancelReasonCategoryViewSet, 'cancel_reason_category')

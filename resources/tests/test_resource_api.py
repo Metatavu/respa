@@ -1,15 +1,16 @@
 import datetime
 import pytest
 from copy import deepcopy
-from django.core.urlresolvers import reverse
+from django.urls import reverse
 from django.contrib.gis.geos import Point
 from django.utils import timezone
 from freezegun import freeze_time
 from guardian.shortcuts import assign_perm, remove_perm
+from ..enums import UnitAuthorizationLevel, UnitGroupAuthorizationLevel
 
 from resources.models import (Day, Equipment, Period, Reservation, ReservationMetadataSet, ResourceEquipment,
-                              ResourceType)
-from .utils import assert_response_objects, check_only_safe_methods_allowed
+                              ResourceType, Unit, UnitAuthorization, UnitGroup)
+from .utils import assert_response_objects, check_only_safe_methods_allowed, is_partial_dict_in_list, MAX_QUERIES
 
 
 @pytest.fixture
@@ -27,8 +28,8 @@ def detail_url(resource_in_unit):
     return reverse('resource-detail', kwargs={'pk': resource_in_unit.pk})
 
 
-def _check_permissions_dict(api_client, resource, is_admin, can_make_reservations,
-                            can_ignore_opening_hours):
+def _check_permissions_dict(api_client, resource, is_admin, is_manager, is_viewer, can_make_reservations,
+                            can_ignore_opening_hours, can_bypass_payment):
     """
     Check that user permissions returned from resource endpoint contain correct values
     for given user and resource. api_client should have the user authenticated.
@@ -36,12 +37,16 @@ def _check_permissions_dict(api_client, resource, is_admin, can_make_reservation
 
     url = reverse('resource-detail', kwargs={'pk': resource.pk})
     response = api_client.get(url)
+    print(response.data)
     assert response.status_code == 200
     permissions = response.data['user_permissions']
-    assert len(permissions) == 3
+    assert len(permissions) == 6
     assert permissions['is_admin'] == is_admin
+    assert permissions['is_manager'] == is_manager
+    assert permissions['is_viewer'] == is_viewer
     assert permissions['can_make_reservations'] == can_make_reservations
     assert permissions['can_ignore_opening_hours'] == can_ignore_opening_hours
+    assert permissions['can_bypass_payment'] == can_bypass_payment
 
 
 @pytest.mark.django_db
@@ -60,46 +65,101 @@ def test_user_permissions_in_resource_endpoint(api_client, resource_in_unit, use
     api_client.force_authenticate(user=user)
 
     # normal user, reservable = True
-    _check_permissions_dict(api_client, resource_in_unit, is_admin=False,
-                            can_make_reservations=True, can_ignore_opening_hours=False)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=False, is_manager=False,
+                            is_viewer=False, can_make_reservations=True, can_ignore_opening_hours=False,
+                            can_bypass_payment=False)
 
     # normal user, reservable = False
     resource_in_unit.reservable = False
     resource_in_unit.save()
-    _check_permissions_dict(api_client, resource_in_unit, is_admin=False,
-                            can_make_reservations=False, can_ignore_opening_hours=False)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=False, is_manager=False,
+                            is_viewer=False, can_make_reservations=False, can_ignore_opening_hours=False,
+                            can_bypass_payment=False)
 
-    # staff member, reservable = False
-    user.is_staff = True
+    # admin, reservable = False
+    user.is_general_admin = True
     user.save()
     api_client.force_authenticate(user=user)
-    _check_permissions_dict(api_client, resource_in_unit, is_admin=True,
-                            can_make_reservations=True, can_ignore_opening_hours=True)
-    user.is_staff = False
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=True, is_manager=False,
+                            is_viewer=False, can_make_reservations=True, can_ignore_opening_hours=True,
+                            can_bypass_payment=True)
+    user.is_general_admin = False
     user.save()
 
     # user has explicit permission to make reservation
     user.groups.add(group)
     assign_perm('unit:can_make_reservations', group, resource_in_unit.unit)
     api_client.force_authenticate(user=user)
-    _check_permissions_dict(api_client, resource_in_unit, is_admin=False,
-                            can_make_reservations=True, can_ignore_opening_hours=False)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=False, is_manager=False,
+                            is_viewer=False, can_make_reservations=True, can_ignore_opening_hours=False,
+                            can_bypass_payment=False)
     remove_perm('unit:can_make_reservations', group, resource_in_unit.unit)
 
     resource_group = resource_in_unit.groups.create(name='rg1')
     assign_perm('group:can_make_reservations', group, resource_group)
     api_client.force_authenticate(user=user)
-    _check_permissions_dict(api_client, resource_in_unit, is_admin=False,
-                            can_make_reservations=True, can_ignore_opening_hours=False)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=False, is_manager=False,
+                            is_viewer=False, can_make_reservations=True, can_ignore_opening_hours=False,
+                            can_bypass_payment=False)
 
     assign_perm('unit:can_ignore_opening_hours', group, resource_in_unit.unit)
     api_client.force_authenticate(user=user)
-    _check_permissions_dict(api_client, resource_in_unit, is_admin=False,
-                            can_make_reservations=True, can_ignore_opening_hours=True)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=False, is_manager=False,
+                            is_viewer=False, can_make_reservations=True, can_ignore_opening_hours=True,
+                            can_bypass_payment=False)
+    remove_perm('unit:can_ignore_opening_hours', group, resource_in_unit.unit)
+
+    # user has explicit permission to bypass payment
+    assign_perm('unit:can_bypass_payment', group, resource_in_unit.unit)
+    api_client.force_authenticate(user=user)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=False, is_manager=False,
+                            is_viewer=False, can_make_reservations=True, can_ignore_opening_hours=False,
+                            can_bypass_payment=True)
+    remove_perm('unit:can_bypass_payment', group, resource_in_unit.unit)
+
+    # unit admins can ignore opening hours
+    user.is_general_admin = False
+    user.save()
+    user.unit_authorizations.create(
+        authorized=user,
+        level=UnitAuthorizationLevel.admin,
+        subject=resource_in_unit.unit
+    )
+    user.save()
+    api_client.force_authenticate(user=user)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=True, is_manager=False,
+                            is_viewer=False, can_make_reservations=True,can_ignore_opening_hours=True,
+                            can_bypass_payment=True)
+    user.unit_authorizations.all().delete()
+
+    # unit managers can ignore opening hours
+    user.unit_authorizations.create(
+        authorized=user,
+        level=UnitAuthorizationLevel.manager,
+        subject=resource_in_unit.unit
+    )
+    user.save()
+    api_client.force_authenticate(user=user)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=False, is_manager=True,
+                            is_viewer=False, can_make_reservations=True, can_ignore_opening_hours=True,
+                            can_bypass_payment=True)
+    user.unit_authorizations.all().delete()
+
+    # unit viewer
+    user.unit_authorizations.create(
+        authorized=user,
+        level=UnitAuthorizationLevel.viewer,
+        subject=resource_in_unit.unit
+    )
+    user.save()
+    api_client.force_authenticate(user=user)
+    _check_permissions_dict(api_client, resource_in_unit, is_admin=False, is_manager=False,
+                            is_viewer=True, can_make_reservations=True, can_ignore_opening_hours=False,
+                            can_bypass_payment=False)
 
 
 @pytest.mark.django_db
-def test_non_public_resource_visibility(api_client, resource_in_unit, user):
+def test_non_public_resource_visibility(api_client, resource_in_unit, user, staff_user):
     """
     Tests that non-public resources are not returned for non-staff.
     """
@@ -123,16 +183,66 @@ def test_non_public_resource_visibility(api_client, resource_in_unit, user):
     assert response.status_code == 200
     assert response.data['count'] == 0
 
-    # Authenticated as staff
+    # Authenticated as non-admin staff
     user.is_staff = True
     user.save()
     response = api_client.get(url)
     assert response.status_code == 200
-    assert response.data['count'] == 1
+    assert response.data['count'] == 0
 
+    # Authenticated as admin
+    user.is_general_admin = True
+    user.save()
+    response = api_client.get(url)
+    assert response.status_code == 200
+    assert response.data['count'] == 1
     url = reverse('resource-detail', kwargs={'pk': resource_in_unit.pk})
     response = api_client.get(url)
     assert response.status_code == 200
+
+    # Authenticated as unit manager
+    user.is_general_admin = False
+    user.save()
+    user.unit_authorizations.create(
+        authorized=staff_user,
+        level=UnitAuthorizationLevel.manager,
+        subject=resource_in_unit.unit
+    )
+    user.save()
+    url = reverse('resource-list')
+    response = api_client.get(url)
+    assert response.status_code == 200
+    assert response.data['count'] == 1
+    assert Unit.objects.managed_by(user).values_list('id', flat=True)[0] == response.data['results'][0]['unit']
+
+    # Authenticated as unit admin
+    user.unit_authorizations.create(
+        authorized=staff_user,
+        level=UnitAuthorizationLevel.admin,
+        subject=resource_in_unit.unit
+    )
+    user.save()
+    url = reverse('resource-list')
+    response = api_client.get(url)
+    assert response.status_code == 200
+    assert response.data['count'] == 1
+    assert Unit.objects.managed_by(user).values_list('id', flat=True)[0] == response.data['results'][0]['unit']
+
+    # Authenticated as unit group admin
+    user.unit_authorizations.all().delete()
+    unit_group = UnitGroup.objects.create(name='foo')
+    unit_group.members.add(resource_in_unit.unit)
+    user.unit_group_authorizations.create(
+        authorized=staff_user,
+        level=UnitGroupAuthorizationLevel.admin,
+        subject=unit_group
+    )
+    user.save()
+    url = reverse('resource-list')
+    response = api_client.get(url)
+    assert response.status_code == 200
+    assert response.data['count'] == 1
+    assert Unit.objects.managed_by(user).values_list('id', flat=True)[0] == response.data['results'][0]['unit']
 
 
 @pytest.mark.django_db
@@ -289,11 +399,16 @@ def test_api_resource_terms_of_use(api_client, resource_in_unit, detail_url):
     assert response.status_code == 200
 
     generic_terms = response.data['generic_terms']
+    payment_terms = response.data['payment_terms']
     specific_terms = response.data['specific_terms']
 
     assert set(generic_terms) == {'fi', 'en'}
     assert generic_terms['fi'] == 'kaikki on kielletty'
     assert generic_terms['en'] == 'everything is forbidden'
+
+    assert set(payment_terms) == {'fi', 'en'}
+    assert payment_terms['fi'] == 'kaikki on maksullista'
+    assert payment_terms['en'] == 'everything is chargeable'
 
     assert set(specific_terms) == {'fi', 'en'}
     assert specific_terms['fi'] == 'spesifiset käyttöehdot'
@@ -301,16 +416,19 @@ def test_api_resource_terms_of_use(api_client, resource_in_unit, detail_url):
 
 
 @pytest.mark.django_db
-def test_price_per_hour_fields(api_client, resource_in_unit, detail_url):
-    resource_in_unit.min_price_per_hour = '5.05'
-    resource_in_unit.max_price_per_hour = None
+def test_price_fields(api_client, resource_in_unit, detail_url):
+    resource_in_unit.min_price = '5.05'
+    resource_in_unit.max_price = None
+    resource_in_unit.price_type = resource_in_unit.PRICE_TYPE_HOURLY
+
     resource_in_unit.save()
 
     response = api_client.get(detail_url)
     assert response.status_code == 200
 
-    assert response.data['min_price_per_hour'] == '5.05'
-    assert response.data['max_price_per_hour'] is None
+    assert response.data['min_price'] == '5.05'
+    assert response.data['max_price'] is None
+    assert response.data['price_type'] == resource_in_unit.PRICE_TYPE_HOURLY
 
 
 @freeze_time('2016-10-25')
@@ -320,28 +438,28 @@ def test_reservable_in_advance_fields(api_client, resource_in_unit, test_unit, d
     assert response.status_code == 200
 
     # the unit and the resource both have days None, so expect None in the fields
-    assert response.data['reservable_days_in_advance'] is None
+    assert response.data['reservable_max_days_in_advance'] is None
     assert response.data['reservable_before'] is None
 
-    test_unit.reservable_days_in_advance = 5
+    test_unit.reservable_max_days_in_advance = 5
     test_unit.save()
 
     response = api_client.get(detail_url)
     assert response.status_code == 200
 
     # only the unit has days set, expect those on the resource
-    assert response.data['reservable_days_in_advance'] == 5
+    assert response.data['reservable_max_days_in_advance'] == 5
     before = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=6)
     assert response.data['reservable_before'] == before
 
-    resource_in_unit.reservable_days_in_advance = 10
+    resource_in_unit.reservable_max_days_in_advance = 10
     resource_in_unit.save()
 
     response = api_client.get(detail_url)
     assert response.status_code == 200
 
     # both the unit and the resource have days set, expect the resource's days to override the unit's days
-    assert response.data['reservable_days_in_advance'] == 10
+    assert response.data['reservable_max_days_in_advance'] == 10
     before = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=11)
     assert response.data['reservable_before'] == before
 
@@ -369,6 +487,13 @@ def test_resource_group_filter(api_client, resource_in_unit, resource_in_unit2, 
     )
     assert response.status_code == 200
     assert set(r['id'] for r in response.data['results']) == {resource_in_unit.id, resource_in_unit2.id}
+
+
+@pytest.mark.django_db
+def test_include_unit_detail(api_client, resource_in_unit, list_url):
+    response = api_client.get(list_url + '?include=unit_detail')
+    assert response.status_code == 200
+    assert response.json()['results'][0]['unit']['id'] == resource_in_unit.unit.id
 
 
 @pytest.mark.django_db
@@ -430,7 +555,7 @@ def test_resource_equipment_filter(api_client, resource_in_unit, resource_in_uni
         resource=resource_in_unit2,
         description='resource equipment 2',
     )
-    resource_in_unit3.resource_equipment = [resource_equipment]
+    resource_in_unit3.resource_equipment.set([resource_equipment])
 
     response = api_client.get(list_url + '?equipment=%s' % equipment_1.id)
     assert response.status_code == 200
@@ -667,3 +792,344 @@ def test_available_between_with_period(list_url, resource_in_unit, resource_in_u
     response = user_api_client.get(list_url, params)
     assert response.status_code == 200
     assert_response_objects(response, expected_resources)
+
+
+@pytest.mark.django_db
+def test_filtering_free_of_charge(list_url, api_client, resource_in_unit,
+                                  resource_in_unit2, resource_in_unit3):
+    free_resource = resource_in_unit
+    free_resource2 = resource_in_unit2
+    not_free_resource = resource_in_unit3
+
+    free_resource.min_price = 0
+    free_resource.save()
+    not_free_resource.min_price = 9001
+    not_free_resource.save()
+
+    response = api_client.get('{0}?free_of_charge=true'.format(list_url))
+    assert response.status_code == 200
+    assert_response_objects(response, [free_resource, free_resource2])
+
+    response = api_client.get('{0}?free_of_charge=false'.format(list_url))
+    assert response.status_code == 200
+    assert_response_objects(response, not_free_resource)
+
+
+@pytest.mark.django_db
+def test_filtering_by_municipality(list_url, api_client, resource_in_unit, test_unit, test_municipality):
+    test_unit.municipality = test_municipality
+    test_unit.save()
+
+    response = api_client.get('%s?municipality=foo' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, resource_in_unit)
+
+    response = api_client.get('%s?municipality=bar' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [])
+
+
+@pytest.mark.django_db
+def test_order_by_filter(list_url, api_client, resource_in_unit, resource_in_unit2):
+    # test resource_name_fi
+    resource_in_unit.name_fi, resource_in_unit.name_en, resource_in_unit.name_sv = 'aaa'
+    resource_in_unit.save()
+
+    resource_in_unit2.name_fi, resource_in_unit2.name_en, resource_in_unit2.name_sv = 'bbb'
+    resource_in_unit2.save()
+
+    response = api_client.get('%s?order_by=resource_name_fi' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['name']['fi'] == resource_in_unit.name_fi
+    assert response.data['results'][1]['name']['fi'] == resource_in_unit2.name_fi
+
+    response = api_client.get('%s?order_by=-resource_name_fi' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['name']['fi'] == resource_in_unit.name_fi
+    assert response.data['results'][0]['name']['fi'] == resource_in_unit2.name_fi
+
+    # test resource_name_en
+    response = api_client.get('%s?order_by=resource_name_en' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['name']['en'] == resource_in_unit.name_en
+    assert response.data['results'][1]['name']['en'] == resource_in_unit2.name_en
+
+    response = api_client.get('%s?order_by=-resource_name_en' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['name']['en'] == resource_in_unit.name_en
+    assert response.data['results'][0]['name']['en'] == resource_in_unit2.name_en
+
+    # test resource_name_sv
+    response = api_client.get('%s?order_by=resource_name_sv' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['name']['sv'] == resource_in_unit.name_sv
+    assert response.data['results'][1]['name']['sv'] == resource_in_unit2.name_sv
+
+    response = api_client.get('%s?order_by=-resource_name_sv' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['name']['sv'] == resource_in_unit.name_sv
+    assert response.data['results'][0]['name']['sv'] == resource_in_unit2.name_sv
+
+    # test unit_name_fi
+    resource_in_unit.unit.name_fi, resource_in_unit.unit.name_en, resource_in_unit.unit.name_sv = 'aaa'
+    resource_in_unit.unit.save()
+
+    resource_in_unit2.unit.name_fi, resource_in_unit2.unit.name_en, resource_in_unit2.unit.name_sv = 'bbb'
+    resource_in_unit2.unit.save()
+
+    response = api_client.get('%s?order_by=unit_name_fi' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['unit'] == resource_in_unit.unit.id
+    assert response.data['results'][1]['unit'] == resource_in_unit2.unit.id
+
+    response = api_client.get('%s?order_by=-unit_name_fi' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['unit'] == resource_in_unit.unit.id
+    assert response.data['results'][0]['unit'] == resource_in_unit2.unit.id
+
+    # test unit_name_en
+    response = api_client.get('%s?order_by=unit_name_en' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['unit'] == resource_in_unit.unit.id
+    assert response.data['results'][1]['unit'] == resource_in_unit2.unit.id
+
+    response = api_client.get('%s?order_by=-unit_name_en' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['unit'] == resource_in_unit.unit.id
+    assert response.data['results'][0]['unit'] == resource_in_unit2.unit.id
+
+    # test unit_name_sv
+    response = api_client.get('%s?order_by=unit_name_sv' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['unit'] == resource_in_unit.unit.id
+    assert response.data['results'][1]['unit'] == resource_in_unit2.unit.id
+
+    response = api_client.get('%s?order_by=-unit_name_sv' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['unit'] == resource_in_unit.unit.id
+    assert response.data['results'][0]['unit'] == resource_in_unit2.unit.id
+
+    # test resource type_fi
+    resource_in_unit.type = ResourceType(id='foo', main_type='foo', name_fi='aaaa')
+    resource_in_unit.type.save()
+    resource_in_unit.save()
+
+    resource_in_unit2.type = ResourceType(id='foo', main_type='foo', name_fi='bbbb')
+    resource_in_unit2.type.save()
+    resource_in_unit2.save()
+
+    response = api_client.get('%s?order_by=type_name_fi' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['type']['id'] == resource_in_unit.type.id
+    assert response.data['results'][1]['type']['id'] == resource_in_unit2.type.id
+
+    response = api_client.get('%s?order_by=-type_name_fi' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['type']['id'] == resource_in_unit.type.id
+    assert response.data['results'][0]['type']['id'] == resource_in_unit2.type.id
+
+
+    # test resource type_en
+    resource_in_unit.type = ResourceType(id='foo', main_type='foo', name_en='aaaa')
+    resource_in_unit.type.save()
+    resource_in_unit.save()
+
+    resource_in_unit2.type = ResourceType(id='foo', main_type='foo', name_en='bbbb')
+    resource_in_unit2.type.save()
+    resource_in_unit2.save()
+
+    response = api_client.get('%s?order_by=type_name_en' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['type']['id'] == resource_in_unit.type.id
+    assert response.data['results'][1]['type']['id'] == resource_in_unit2.type.id
+
+    response = api_client.get('%s?order_by=-type_name_en' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['type']['id'] == resource_in_unit.type.id
+    assert response.data['results'][0]['type']['id'] == resource_in_unit2.type.id
+
+
+    # test resource type_sv
+    resource_in_unit.type = ResourceType(id='foo', main_type='foo', name_sv='aaaa')
+    resource_in_unit.type.save()
+    resource_in_unit.save()
+
+    resource_in_unit2.type = ResourceType(id='foo', main_type='foo', name_sv='bbbb')
+    resource_in_unit2.type.save()
+    resource_in_unit2.save()
+
+    response = api_client.get('%s?order_by=type_name_sv' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['type']['id'] == resource_in_unit.type.id
+    assert response.data['results'][1]['type']['id'] == resource_in_unit2.type.id
+
+    response = api_client.get('%s?order_by=-type_name_sv' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['type']['id'] == resource_in_unit.type.id
+    assert response.data['results'][0]['type']['id'] == resource_in_unit2.type.id
+
+    # test resource people capacity
+    resource_in_unit.people_capacity = 1
+    resource_in_unit.save()
+
+    resource_in_unit2.people_capacity = 50
+    resource_in_unit2.save()
+
+    response = api_client.get('%s?order_by=people_capacity' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][0]['people_capacity'] == resource_in_unit.people_capacity
+    assert response.data['results'][1]['people_capacity'] == resource_in_unit2.people_capacity
+
+    response = api_client.get('%s?order_by=-people_capacity' % list_url)
+    assert response.status_code == 200
+    assert_response_objects(response, [resource_in_unit, resource_in_unit2])
+    assert response.data['results'][1]['people_capacity'] == resource_in_unit.people_capacity
+    assert response.data['results'][0]['people_capacity'] == resource_in_unit2.people_capacity
+
+
+@pytest.mark.django_db
+def test_order_by_accessibility_no_viewpoint(list_url, api_client, resource_with_accessibility_data,
+                                             resource_with_accessibility_data2):
+    """ Ordering by accessibility requires that the desired accessibility viewpoint for ordering
+    is provided
+    """
+    response = api_client.get('%s?order_by=accessibility' % list_url)
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_order_by_accessibility(list_url, api_client, resource_with_accessibility_data,
+                                resource_with_accessibility_data2, accessibility_viewpoint_wheelchair,
+                                accessibility_viewpoint_hearing):
+    """ resource_with_accessibility_data should rank higher in wheelchair accessibility
+    resource_with_accessibility_data2 should rank higher in hearing accessibility
+    """
+    response = api_client.get('{}?order_by=-accessibility&accessibility_viewpoint={}'.format(
+        list_url, accessibility_viewpoint_wheelchair.id
+    ))
+    assert response.status_code == 200
+
+    assert_response_objects(response, [resource_with_accessibility_data, resource_with_accessibility_data2])
+    assert response.data['results'][0]['name']['fi'] == resource_with_accessibility_data.name_fi
+    assert response.data['results'][1]['name']['fi'] == resource_with_accessibility_data2.name_fi
+
+    response = api_client.get('{}?order_by=-accessibility&accessibility_viewpoint={}'.format(
+        list_url, accessibility_viewpoint_hearing.id
+    ))
+    assert response.status_code == 200
+
+    assert_response_objects(response, [resource_with_accessibility_data, resource_with_accessibility_data2])
+    assert response.data['results'][0]['name']['fi'] == resource_with_accessibility_data2.name_fi
+    assert response.data['results'][1]['name']['fi'] == resource_with_accessibility_data.name_fi
+
+
+@pytest.mark.django_db
+def test_order_by_accessibility_multiple_viewpoints(
+        list_url, api_client, resource_with_accessibility_data,
+        resource_with_accessibility_data4, accessibility_viewpoint_wheelchair,
+        accessibility_viewpoint_hearing):
+    """ resource_with_accessibility_data4 should rank higher as it is accessible from both viewpoints
+    """
+    response = api_client.get(
+        (
+            '{}?order_by=-accessibility'
+            '&accessibility_viewpoint={}'
+            '&accessibility_viewpoint={}'
+        ).format(
+            list_url,
+            accessibility_viewpoint_wheelchair.id,
+            accessibility_viewpoint_hearing.id,
+        )
+    )
+    assert response.status_code == 200
+
+    assert_response_objects(response, [resource_with_accessibility_data, resource_with_accessibility_data4])
+    assert response.data['results'][0]['name']['fi'] == resource_with_accessibility_data4.name_fi
+    assert response.data['results'][1]['name']['fi'] == resource_with_accessibility_data.name_fi
+
+    response = api_client.get(
+        (
+            '{}?order_by=accessibility'
+            '&accessibility_viewpoint={}'
+            '&accessibility_viewpoint={}'
+        ).format(
+            list_url,
+            accessibility_viewpoint_wheelchair.id,
+            accessibility_viewpoint_hearing.id,
+        )
+    )
+    assert response.status_code == 200
+
+    assert_response_objects(response, [resource_with_accessibility_data, resource_with_accessibility_data4])
+    assert response.data['results'][0]['name']['fi'] == resource_with_accessibility_data.name_fi
+    assert response.data['results'][1]['name']['fi'] == resource_with_accessibility_data4.name_fi
+
+
+@pytest.mark.django_db
+def test_order_by_accessibility_inaccessible_unit(list_url, api_client, resource_with_accessibility_data,
+                                                  resource_with_accessibility_data3,
+                                                  accessibility_viewpoint_wheelchair):
+    """ resource_with_accessibility_data should rank higher in wheelchair accessibility.
+    resource_with_accessibility_data3 is wheelchair accessible, but
+    resource_with_accessibility_data3.unit is not wheelchair accessible
+    """
+    response = api_client.get('{}?order_by=-accessibility&accessibility_viewpoint={}'.format(
+        list_url, accessibility_viewpoint_wheelchair.id
+    ))
+    assert response.status_code == 200
+
+    assert_response_objects(response, [resource_with_accessibility_data, resource_with_accessibility_data3])
+    assert response.data['results'][0]['name']['fi'] == resource_with_accessibility_data.name_fi
+    assert response.data['results'][1]['name']['fi'] == resource_with_accessibility_data3.name_fi
+
+
+@pytest.mark.django_db
+def test_resource_with_accessibility_data_no_include(api_client, resource_with_accessibility_data, detail_url):
+    """ Resource endpoint should not include accessibility data when not explicitly included """
+    response = api_client.get(detail_url)
+    assert response.status_code == 200
+    assert 'accessibility_summaries' not in response.data
+
+
+@pytest.mark.django_db
+def test_resource_with_accessibility_data(api_client, resource_with_accessibility_data, detail_url):
+    """ Resource endpoint should include accessibility data when include-parameter is used """
+    url = "{}?include=accessibility_summaries".format(detail_url)
+    response = api_client.get(url)
+    assert response.status_code == 200
+    assert 'accessibility_summaries' in response.data
+    for acc in resource_with_accessibility_data.accessibility_summaries.all():
+        assert is_partial_dict_in_list(
+            {'value': acc.value.value, 'viewpoint_id': acc.viewpoint_id},
+            response.data['accessibility_summaries'])
+
+
+@pytest.mark.django_db
+def test_query_counts(user_api_client, staff_api_client, list_url, django_assert_max_num_queries):
+    """
+    Test that DB query count is less than allowed
+    """
+    with django_assert_max_num_queries(MAX_QUERIES):
+        user_api_client.get(list_url)
+
+    with django_assert_max_num_queries(MAX_QUERIES):
+        staff_api_client.get(list_url)

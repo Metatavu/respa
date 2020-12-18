@@ -30,6 +30,10 @@ def get_commentable_content_types():
     return ContentType.objects.get_for_models(*COMMENTABLE_MODELS.values()).values()
 
 
+def get_content_type_choices():
+    return {'id__in': (ct.id for ct in get_commentable_content_types())}
+
+
 class CommentQuerySet(models.QuerySet):
     def can_view(self, user):
         if not user.is_authenticated:
@@ -64,7 +68,7 @@ class Comment(models.Model):
     content_type = models.ForeignKey(
         ContentType,
         on_delete=models.CASCADE,
-        limit_choices_to=lambda: {'id__in': (ct.id for ct in get_commentable_content_types())}
+        limit_choices_to=get_content_type_choices
     )
     object_id = models.PositiveIntegerField()
     content_object = GenericForeignKey('content_type', 'object_id')
@@ -99,7 +103,7 @@ class Comment(models.Model):
         elif target_model == CateringOrder:
             if user == target_object.reservation.user:
                 return True
-            if target_object.reservation.resource.can_view_catering_orders(user):
+            if target_object.reservation.resource.can_view_reservation_catering_orders(user):
                 return True
         return False
 
@@ -155,9 +159,20 @@ class Comment(models.Model):
             return
 
         if email:
-            send_respa_mail(email, rendered_notification['subject'], rendered_notification['body'])
+            send_respa_mail(
+                email,
+                rendered_notification['subject'],
+                rendered_notification['body'],
+                rendered_notification['html_body']
+            )
         if self.created_by != reserver and reserver.email:
-            send_respa_mail(reserver.email, rendered_notification['subject'], rendered_notification['body'])
+            send_respa_mail(
+                reserver.email,
+                rendered_notification['subject'],
+                rendered_notification['body'],
+                rendered_notification['html_body']
+            )
 
     def send_created_notification(self, request=None):
         self._send_notification(request)
+

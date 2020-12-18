@@ -1,6 +1,13 @@
 #!/bin/bash
 
-if [ "$TRAVIS_PYTHON_VERSION" != "3.5" ]; then
+# Travis does not set secret variables, if the pull request comes
+# from outside our own repository
+if [ -z "$DOCKER_PASSWORD" ]; then
+    echo "Need Docker login credentials to proceed"
+    exit 0
+fi
+
+if [ "$TRAVIS_PYTHON_VERSION" != "3.6" ]; then
     echo "Only deploy on production Python build"
     exit 0
 fi
@@ -30,24 +37,11 @@ if [ "$TRAVIS_PULL_REQUEST" != false ]; then
     exit 0
 fi
 
-if [ "$TRAVIS_BRANCH" == "master" ] ; then
-    echo "Tagging master"
-    docker tag "$IMAGE" "$REPO:$COMMIT"
-    docker tag "$REPO:$COMMIT" $REPO:latest
-    docker tag "$REPO:$COMMIT" "$REPO:travis-$TRAVIS_BUILD_NUMBER"
-    docker push "$REPO:$COMMIT"
-    docker push "$REPO:latest"
-    docker push "$REPO:travis-$TRAVIS_BUILD_NUMBER"
-    exit 0
-fi
-
-if [ "$TRAVIS_BRANCH" != "master" ] ; then
-    echo "Tagging branch " "$TRAVIS_BRANCH"
-    docker tag "$IMAGE" "$REPO:$COMMIT"
-    docker tag "$REPO:$COMMIT" "$REPO:$BRANCH"
-    docker tag "$REPO:$COMMIT" "$REPO:travis-$TRAVIS_BUILD_NUMBER"
-    docker push "$REPO:$COMMIT"
-    docker push "$REPO:travis-$TRAVIS_BUILD_NUMBER"
-    docker push "$REPO:$BRANCH"
-    exit 0
-fi
+echo "Tagging branch " "$TRAVIS_BRANCH"
+docker tag "$IMAGE" "$REPO:$COMMIT"
+docker tag "$REPO:$COMMIT" "$REPO:$BRANCH"
+docker tag "$REPO:$COMMIT" "$REPO:travis-$TRAVIS_BUILD_NUMBER"
+docker push "$REPO:$COMMIT"
+docker push "$REPO:travis-$TRAVIS_BUILD_NUMBER"
+docker push "$REPO:$BRANCH"
+exit 0

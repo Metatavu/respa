@@ -5,8 +5,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from rest_framework.test import APIClient, APIRequestFactory
 
-from resources.models import Resource, ResourceType, Unit, Purpose, Day, Period
+from resources.enums import UnitAuthorizationLevel
+from resources.models import Resource, ResourceType, Unit, UnitIdentifier, Purpose, Day, Period
 from resources.models import Equipment, EquipmentAlias, ResourceEquipment, EquipmentCategory, TermsOfUse, ResourceGroup
+from resources.models import AccessibilityValue, AccessibilityViewpoint, ResourceAccessibility, UnitAccessibility
+from munigeo.models import Municipality
 
 
 @pytest.fixture
@@ -32,7 +35,7 @@ def user_api_client(user):
 def all_user_types_api_client(request):
     api_client = APIClient()
     if request.param:
-        api_client.force_authenticate(request.getfuncargvalue(request.param))
+        api_client.force_authenticate(request.getfixturevalue(request.param))
     return api_client
 
 
@@ -59,18 +62,31 @@ def test_unit():
     return Unit.objects.create(name="unit", time_zone='Europe/Helsinki')
 
 
+@pytest.mark.django_db
 @pytest.fixture
 def test_unit2():
     return Unit.objects.create(name="unit 2", time_zone='Europe/Helsinki')
 
 
+@pytest.mark.django_db
 @pytest.fixture
 def test_unit3():
-    return Unit.objects.create(name="unit 3", time_zone='Europe/Helsinki')
+    unit = Unit.objects.create(name="unit 3", time_zone='Europe/Helsinki')
+    UnitIdentifier.objects.create(unit=unit, namespace='internal', value=1)
+    return unit
 
 
+@pytest.mark.django_db
 @pytest.fixture
-def terms_of_use():
+def test_unit4():
+    unit = Unit.objects.create(name="unit 4", time_zone='Europe/Helsinki')
+    UnitIdentifier.objects.create(unit=unit, namespace='internal', value=1)
+    return unit
+
+
+@pytest.mark.django_db
+@pytest.fixture
+def generic_terms():
     return TermsOfUse.objects.create(
         name_fi='testikäyttöehdot',
         name_en='test terms of use',
@@ -81,7 +97,19 @@ def terms_of_use():
 
 @pytest.mark.django_db
 @pytest.fixture
-def resource_in_unit(space_resource_type, test_unit, terms_of_use):
+def payment_terms():
+    return TermsOfUse.objects.create(
+        name_fi='testimaksuehdot',
+        name_en='test terms of payment',
+        text_fi='kaikki on maksullista',
+        text_en='everything is chargeable',
+        terms_type=TermsOfUse.TERMS_TYPE_PAYMENT
+    )
+
+
+@pytest.mark.django_db
+@pytest.fixture
+def resource_in_unit(space_resource_type, test_unit, generic_terms, payment_terms):
     return Resource.objects.create(
         type=space_resource_type,
         authentication="none",
@@ -90,7 +118,8 @@ def resource_in_unit(space_resource_type, test_unit, terms_of_use):
         max_reservations_per_user=1,
         max_period=datetime.timedelta(hours=2),
         reservable=True,
-        generic_terms=terms_of_use,
+        generic_terms=generic_terms,
+        payment_terms=payment_terms,
         specific_terms_fi='spesifiset käyttöehdot',
         specific_terms_en='specific terms of use',
         reservation_confirmed_notification_extra_en='this resource rocks'
@@ -127,6 +156,20 @@ def resource_in_unit3(space_resource_type, test_unit3):
 
 @pytest.mark.django_db
 @pytest.fixture
+def resource_in_unit4(space_resource_type, test_unit4):
+    return Resource.objects.create(
+        type=space_resource_type,
+        authentication="none",
+        name="resource in unit 4",
+        unit=test_unit4,
+        max_reservations_per_user=2,
+        max_period=datetime.timedelta(hours=4),
+        reservable=True,
+    )
+
+
+@pytest.mark.django_db
+@pytest.fixture
 def resource_with_opening_hours(resource_in_unit):
     p1 = Period.objects.create(start=datetime.date(2115, 1, 1),
                                end=datetime.date(2115, 12, 31),
@@ -136,6 +179,7 @@ def resource_with_opening_hours(resource_in_unit):
                            opens=datetime.time(8, 0),
                            closes=datetime.time(18, 0))
     resource_in_unit.update_opening_hours()
+    return resource_in_unit
 
 
 @pytest.mark.django_db
@@ -233,6 +277,65 @@ def staff_user():
 
 @pytest.mark.django_db
 @pytest.fixture
+def unit_admin_user(resource_in_unit):
+    user = get_user_model().objects.create(
+        username='test_admin_user',
+        first_name='Inspector',
+        last_name='Lestrade',
+        email='lestrade@scotlandyard.co.uk',
+        is_staff=True,
+        preferred_language='en'
+    )
+    user.unit_authorizations.create(subject=resource_in_unit.unit, level=UnitAuthorizationLevel.admin)
+    return user
+
+
+@pytest.mark.django_db
+@pytest.fixture
+def unit_manager_user(resource_in_unit):
+    user = get_user_model().objects.create(
+        username='test_manager_user',
+        first_name='Inspector',
+        last_name='Lestrade',
+        email='lestrade@scotlandyard.co.uk',
+        is_staff=True,
+        preferred_language='en'
+    )
+    user.unit_authorizations.create(subject=resource_in_unit.unit, level=UnitAuthorizationLevel.manager)
+    return user
+
+
+@pytest.mark.django_db
+@pytest.fixture
+def unit_viewer_user(resource_in_unit):
+    user = get_user_model().objects.create(
+        username='test_viewer_user',
+        first_name='Inspector',
+        last_name='Watson',
+        email='watson@scotlandyard.co.uk',
+        is_staff=True,
+        preferred_language='en'
+    )
+    user.unit_authorizations.create(subject=resource_in_unit.unit, level=UnitAuthorizationLevel.viewer)
+    return user
+
+
+@pytest.mark.django_db
+@pytest.fixture
+def general_admin():
+    return get_user_model().objects.create(
+        username='test_general_admin',
+        first_name='Genie',
+        last_name='Manager',
+        email='genie.manager@example.com',
+        is_staff=True,
+        is_general_admin=True,
+        preferred_language='en'
+    )
+
+
+@pytest.mark.django_db
+@pytest.fixture
 def group():
     return Group.objects.create(name='test group')
 
@@ -249,7 +352,7 @@ def resource_group(resource_in_unit):
         identifier='test_group',
         name='Test resource group'
     )
-    group.resources = [resource_in_unit]
+    group.resources.set([resource_in_unit])
     return group
 
 
@@ -259,5 +362,163 @@ def resource_group2(resource_in_unit2):
         identifier='test_group_2',
         name='Test resource group 2'
     )
-    group.resources = [resource_in_unit2]
+    group.resources.set([resource_in_unit2])
     return group
+
+@pytest.fixture
+def test_municipality():
+    municipality = Municipality.objects.create(
+        id='foo',
+        name='Foo'
+    )
+    return municipality
+
+
+@pytest.fixture
+def accessibility_viewpoint_wheelchair():
+    vp = {"id": "10", "name_en": "I am a wheelchair user", "order_text": 10}
+    return AccessibilityViewpoint.objects.create(**vp)
+
+
+@pytest.fixture
+def accessibility_viewpoint_hearing():
+    vp = {"id": "20", "name_en": "I am hearing impaired", "order_text": 20}
+    return AccessibilityViewpoint.objects.create(**vp)
+
+
+@pytest.fixture
+def accessibility_value_green():
+    return AccessibilityValue.objects.create(value='green', order=10)
+
+
+@pytest.fixture
+def accessibility_value_red():
+    return AccessibilityValue.objects.create(value='red', order=-10)
+
+
+@pytest.fixture
+def resource_with_accessibility_data(resource_in_unit, accessibility_viewpoint_wheelchair,
+                                     accessibility_viewpoint_hearing, accessibility_value_green,
+                                     accessibility_value_red):
+    """ Resource is wheelchair accessible, not hearing accessible, unit is accessible to both """
+    ResourceAccessibility.objects.create(
+        resource=resource_in_unit,
+        viewpoint=accessibility_viewpoint_wheelchair,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    ResourceAccessibility.objects.create(
+        resource=resource_in_unit,
+        viewpoint=accessibility_viewpoint_hearing,
+        value=accessibility_value_red,
+        shortage_count=0,
+    )
+    UnitAccessibility.objects.create(
+        unit=resource_in_unit.unit,
+        viewpoint=accessibility_viewpoint_wheelchair,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    UnitAccessibility.objects.create(
+        unit=resource_in_unit.unit,
+        viewpoint=accessibility_viewpoint_hearing,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    return resource_in_unit
+
+
+@pytest.fixture
+def resource_with_accessibility_data2(resource_in_unit2, accessibility_viewpoint_wheelchair,
+                                      accessibility_viewpoint_hearing, accessibility_value_green,
+                                      accessibility_value_red):
+    """ Resource is hearing accessible, not wheelchair accessible, unit is accessible to both """
+    ResourceAccessibility.objects.create(
+        resource=resource_in_unit2,
+        viewpoint=accessibility_viewpoint_wheelchair,
+        value=accessibility_value_red,
+        shortage_count=0,
+    )
+    ResourceAccessibility.objects.create(
+        resource=resource_in_unit2,
+        viewpoint=accessibility_viewpoint_hearing,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    UnitAccessibility.objects.create(
+        unit=resource_in_unit2.unit,
+        viewpoint=accessibility_viewpoint_wheelchair,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    UnitAccessibility.objects.create(
+        unit=resource_in_unit2.unit,
+        viewpoint=accessibility_viewpoint_hearing,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    return resource_in_unit2
+
+
+@pytest.fixture
+def resource_with_accessibility_data3(resource_in_unit3, accessibility_viewpoint_wheelchair,
+                                      accessibility_viewpoint_hearing, accessibility_value_green,
+                                      accessibility_value_red):
+    """ Resource is accessible, unit is not """
+    ResourceAccessibility.objects.create(
+        resource=resource_in_unit3,
+        viewpoint=accessibility_viewpoint_wheelchair,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    ResourceAccessibility.objects.create(
+        resource=resource_in_unit3,
+        viewpoint=accessibility_viewpoint_hearing,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    UnitAccessibility.objects.create(
+        unit=resource_in_unit3.unit,
+        viewpoint=accessibility_viewpoint_wheelchair,
+        value=accessibility_value_red,
+        shortage_count=0,
+    )
+    UnitAccessibility.objects.create(
+        unit=resource_in_unit3.unit,
+        viewpoint=accessibility_viewpoint_hearing,
+        value=accessibility_value_red,
+        shortage_count=0,
+    )
+    return resource_in_unit3
+
+
+@pytest.fixture
+def resource_with_accessibility_data4(resource_in_unit4, accessibility_viewpoint_wheelchair,
+                                      accessibility_viewpoint_hearing, accessibility_value_green):
+    """ Resource is accessible, unit is accessible """
+    ResourceAccessibility.objects.create(
+        resource=resource_in_unit4,
+        viewpoint=accessibility_viewpoint_wheelchair,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    ResourceAccessibility.objects.create(
+        resource=resource_in_unit4,
+        viewpoint=accessibility_viewpoint_hearing,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    UnitAccessibility.objects.create(
+        unit=resource_in_unit4.unit,
+        viewpoint=accessibility_viewpoint_wheelchair,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    UnitAccessibility.objects.create(
+        unit=resource_in_unit4.unit,
+        viewpoint=accessibility_viewpoint_hearing,
+        value=accessibility_value_green,
+        shortage_count=0,
+    )
+    return resource_in_unit4
+
