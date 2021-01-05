@@ -2,7 +2,6 @@ import datetime
 import os
 import re
 import pytz
-import math
 from collections import OrderedDict
 from decimal import Decimal
 
@@ -347,7 +346,7 @@ class Resource(ModifiableModel, AutoIdentifiedModel):
             days = opening_hours.get(begin.date(), None)
             if days is None or not any(day['opens'] and begin >= day['opens'] and end <= day['closes'] for day in days):
                 raise ValidationError(_("You must start and end the reservation during opening hours"))
-        elif not self.can_ignore_opening_hours(user) and settings.ENABLE_USER_IGNORE_OPENING_HOURS and (True if math.isnan(self.max_period) else (end - begin) <= self.max_period) :
+        elif not self.can_ignore_opening_hours(user) and settings.ENABLE_USER_IGNORE_OPENING_HOURS and not (end - begin) > self.max_period:
             return
 
         if not self.can_ignore_max_period(user) and (self.max_period and (end - begin) > self.max_period):
