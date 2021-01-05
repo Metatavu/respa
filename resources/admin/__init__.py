@@ -238,7 +238,9 @@ class ReservationAdmin(PopulateCreatedAndModifiedMixin, CommonExcludeMixin, Extr
     raw_id_fields = ('user', 'resource')
 
     def save_model(self, request, obj, form, change):
-        obj.set_state(obj.state, request.user)
+        if change:
+            re = Reservation.objects.get(pk=obj.id)
+            re.set_state(obj.state, request.user)
         super().save_model(request, obj, form, change)
 
 
