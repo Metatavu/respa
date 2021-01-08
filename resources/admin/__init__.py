@@ -237,6 +237,12 @@ class ReservationAdmin(PopulateCreatedAndModifiedMixin, CommonExcludeMixin, Extr
     search_fields = ('user__first_name', 'user__last_name', 'user__username', 'user__email')
     raw_id_fields = ('user', 'resource')
 
+    def save_model(self, request, obj, form, change):
+        if change:
+            re = Reservation.objects.get(pk=obj.id)
+            re.set_state(obj.state, request.user)
+        super().save_model(request, obj, form, change)
+
 
 class ReservationCancelReasonCategoryAdmin(PopulateCreatedAndModifiedMixin, CommonExcludeMixin, TranslationAdmin):
     pass
